@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.liubai/
+__pycache__/
+*.pyc
+report-build/
+report/
+design/
+docs/superpowers/
+*.log
+.env
+.env.*
+!*.env.example
+/liubai-storage*.zip
