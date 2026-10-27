@@ -105,7 +105,7 @@ npm run test:python
 
 参与方式见 [CONTRIBUTING.md](CONTRIBUTING.md)，安全问题请按 [SECURITY.md](SECURITY.md) 报告。旧版本地服务仅作为可选兼容模式保留，不属于静态报告的默认入口。
 
-## 许可、参考与支持
+## 许可与参考
 
 本项目以 [MIT License](LICENSE) 开源，Skill 本身可免费使用、修改和分发，具体以许可证为准。第三方组件及其许可不因本项目许可而改变；预构建报告模板内附运行库许可，详情见 [第三方许可说明](THIRD_PARTY_NOTICES.md)。
 
@@ -113,5 +113,3 @@ npm run test:python
 
 - [win11-storage-governance-kit](https://github.com/Nongfsq/win11-storage-governance-kit)（MIT）：借鉴分类治理、配置优先、核验和回退。
 - [windows-disk-cleaner-skill](https://github.com/std-microblock/windows-disk-cleaner-skill)（主项目 Apache-2.0，原生 UI 和图标另有许可）：借鉴索引和交互思路。
-
-可独立提供安装指导或售后服务；任何收费服务的范围、价格与期限应在用户选择前明确说明。完整 Skill 的使用不以购买服务为前提。
