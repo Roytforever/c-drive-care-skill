@@ -41,7 +41,7 @@ class LaunchReportTests(unittest.TestCase):
             result = json.loads(run.stdout)
             self.assertEqual(result['filesCount'], 1)
             self.assertTrue(Path(result['report']).is_file())
-            self.assertTrue(Path(result['report']).is_relative_to(self.output / 'runs'))
+            self.assertTrue(Path(result['report']).resolve().is_relative_to((self.output / 'runs').resolve()))
             results.append(result)
         self.assertNotEqual(results[0]['report'], results[1]['report'])
         self.assertEqual(old_html.read_text(encoding='utf-8'), 'existing report')
