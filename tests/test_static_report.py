@@ -87,6 +87,51 @@ class StaticReportTests(unittest.TestCase):
             encoded = gzip.decompress(base64.b64decode(encoded)).decode('utf-8')
         return result, out, document, parsed, json.loads(encoded)
 
+    def test_extended_file_details_and_coverage_validate_parent_and_counts(self):
+        scan = old_scan()
+        node = scan['directories'][0]
+        node.update(ownFileCount=1,fileDetailsCount=1,directErrors=0,directSkipped=0,
+                    coverage={'status':'complete','errors':0,'skipped':0})
+        scan['fileDetails']=[{**scan['largeFiles'][0],'parentId':'root'}]
+        scan['fileDetailPolicy']={'maxPerDirectory':20,'maxTotal':100000,'retained':1,'omitted':0}
+        generator.validate_scan(scan)
+        for mutation in ('parent','path','count','coverage','policy'):
+            bad=copy.deepcopy(scan)
+            if mutation=='parent': bad['fileDetails'][0]['parentId']='missing'
+            elif mutation=='path': bad['fileDetails'][0]['path']='C:\\elsewhere\\one'
+            elif mutation=='count': bad['directories'][0]['ownFileCount']=-1
+            elif mutation=='coverage': bad['directories'][0]['coverage']['status']='verified'
+            else: bad['fileDetailPolicy']['retained']=5
+            with self.assertRaises(ValueError): generator.validate_scan(bad)
+
+    def test_normalization_copies_once_without_mutating_input(self):
+        payload={'scan':old_scan(),'metadata':{'password':'hidden','keep':[{'token':'hidden','name':'shown'}]}}
+        state=generator.normalize_snapshot(payload)
+        self.assertEqual(state['metadata'],{'keep':[{'name':'shown'}]})
+        state['scan']['directories'][0]['bytes']=99
+        self.assertEqual(payload['scan']['directories'][0]['bytes'],7)
+        self.assertEqual(payload['metadata']['password'],'hidden')
+
+    def test_render_reuses_serialized_state_and_escapes_html(self):
+        raw=json.dumps({'text':'</script>&payload'},ensure_ascii=False)
+        with mock.patch.object(generator.json,'dumps',side_effect=AssertionError('serialized twice')):
+            html=generator.render_report('<!--LIUBAI_REPORT_DATA-->',{},compress=False,serialized=raw)
+        self.assertNotIn('</script>&payload',html)
+        self.assertIn('\\u003c/script\\u003e',html)
+
+    def test_allocation_measurement_is_explicit_and_not_added_to_old_snapshot(self):
+        out=self.root/'measured'
+        with mock.patch.object(generator,'scan_directory',return_value=old_scan(str(self.root))) as scan, \
+             mock.patch.object(generator,'inventory',return_value={'drives':[],'caches':[]}), \
+             contextlib.redirect_stdout(io.StringIO()):
+            result=generator.main([str(self.root),'--out-dir',str(out),'--template',str(self.template),'--measure-allocated'])
+        self.assertEqual(result,0)
+        self.assertTrue(scan.call_args.kwargs['measure_allocated'])
+        snapshot=self.root/'allocation-old.json';snapshot.write_text(json.dumps(old_scan()),encoding='utf-8')
+        result=self.run_cli('--report-only','--index',snapshot,'--measure-allocated','--out-dir',self.root/'must-not-create')
+        self.assertNotEqual(result.returncode,0)
+        self.assertFalse((self.root/'must-not-create').exists())
+
     def test_snapshot_only_preserves_old_measurement_without_current_inventory(self):
         result, out, _, _, state = self.generate(old_scan())
         self.assertEqual(state['sourceMode'], 'snapshot')

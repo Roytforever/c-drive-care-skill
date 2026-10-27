@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createReportModel, safeReportExport, resolveTreeAction, migrationProposal, validateReportState, summarizeCacheCandidates } from '../src/report-model.js';
+import { createReportModel, safeReportExport, resolveTreeAction, migrationProposal, validateReportState, summarizeCacheCandidates, compareSnapshots } from '../src/report-model.js';
 
 const fixture=()=>({version:'2.0-static',scan:{id:'s',root:'C:\\',status:'completed',totalBytes:100,filesCount:8,directories:[
   {id:'r',parentId:null,name:'C:\\',path:'C:\\',bytes:100,ownBytes:0},
@@ -76,4 +76,101 @@ test('export strips execution credentials recursively and migration proposals ne
   assert.equal(proposal.source,'C:\\cache');assert.match(proposal.target,/^E:\\/);assert.equal(proposal.execution,'manual-review');assert.equal(proposal.immediateReleasedBytes,0);
   assert.equal(JSON.stringify(proposal).includes('/api/execute'),false);
   assert.throws(()=>migrationProposal({path:'C:\\cache'},{path:'C:\\',isSystem:true}),/系统/);
+});
+
+
+test('inventory aliases and unsupported tools remain visible with protected custom locations',()=>{
+  const f=fixture();
+  f.caches=[
+    {id:'pnpm',path:'C:\\custom-store',defaultPath:'C:\\Users\\Sample\\AppData\\Local\\pnpm\\store',exists:true,bytes:null,source:'config'},
+    {id:'gradle',path:'C:\\Users\\Sample\\.gradle\\caches',defaultPath:'C:\\Users\\Sample\\.gradle\\caches',exists:true,bytes:12},
+    {id:'maven',path:'C:\\Users\\Sample\\.m2\\repository',exists:true,bytes:13},
+    {id:'future-tool',path:'C:\\unknown',exists:true,bytes:7}
+  ];
+  const m=createReportModel(f);
+  assert.equal(m.candidates.length,5);
+  assert.equal(m.candidates.find(c=>c.tool==='pnpm-store').eligible,false);
+  for(const tool of ['gradle','maven','future-tool'])assert.equal(m.candidates.find(c=>c.tool===tool).risk,'protected');
+});
+
+test('explicit custom inventory overrides a path that also matches a default cache rule',()=>{
+  const f=fixture();
+  f.caches=[{id:'pip',path:f.scan.directories[3].path,defaultPath:'C:\\Users\\Sample\\AppData\\Local\\pip\\Cache',exists:true,source:'environment'}];
+  const candidate=createReportModel(f).candidates.find(c=>c.path===f.scan.directories[3].path);
+  assert.equal(candidate.risk,'protected');assert.equal(candidate.eligible,false);
+  assert.equal(candidate.source,'environment');
+});
+
+test('per-directory files include details outside Top500 and report honest coverage for old snapshots',()=>{
+  const f=fixture();f.scan.directories[3].ownFileCount=3;
+  f.scan.fileDetails=[{parentId:'n',path:f.scan.largeFiles[0].path,name:'x',bytes:10},{parentId:'n',path:f.scan.directories[3].path+'\\small.txt',name:'small.txt',bytes:1}];
+  const m=createReportModel(f);
+  assert.equal(m.files.length,1);assert.equal(m.filesIn(f.scan.directories[3].path,true).length,2);
+  assert.deepEqual({...m.fileCoverage('n'),coverage:undefined},{retained:2,total:3,limited:true,legacy:false,coverage:undefined});
+  const legacy=createReportModel(fixture()).fileCoverage('n');
+  assert.equal(legacy.total,null);assert.equal(legacy.legacy,true);assert.equal(legacy.limited,true);
+});
+
+test('directory search is bounded, excludes root and supports case-insensitive literal paths',()=>{
+  const m=createReportModel(fixture());
+  const first=m.getDirectoryRows('',2);assert.equal(first.items.length,2);assert.equal(first.total,7);assert.equal(first.hasMore,true);
+  assert.equal(first.items[0].id,'u');
+  const result=m.getDirectoryRows('APPDATA',80);assert.equal(result.total,3);assert.equal(result.hasMore,false);
+  assert.equal(m.getDirectoryRows('does-not-exist',80).total,0);
+});
+
+test('new file detail and coverage fields reject malformed imported snapshots',()=>{
+  const f=fixture();f.scan.fileDetails=[{parentId:'missing',path:'C:\\bad',bytes:1}];
+  assert.throws(()=>validateReportState(f),/文件|父/);
+  const bad=fixture();bad.scan.directories[0].ownFileCount=-1;assert.throws(()=>validateReportState(bad),/目录|数量|计数/);
+  const coverage=fixture();coverage.scan.directories[0].coverage={status:'complete',errors:-1,skipped:0};assert.throws(()=>validateReportState(coverage),/覆盖|计数/);
+});
+
+test('snapshot comparisons require equal roots and measurements and retain completeness warnings',()=>{
+  const before=fixture(),after=fixture();before.scan.finishedAt='2024-01-01';after.scan.finishedAt='2024-01-02';
+  before.scan.complete=true;after.scan.complete=false;after.scan.directories[3].bytes=30;
+  const result=compareSnapshots(before,after);
+  assert.equal(result.compatible,true);assert.equal(result.partial,true);assert.equal(result.previousAt,'2024-01-01');
+  assert.equal(result.changes.find(x=>x.path===after.scan.directories[3].path).deltaBytes,20);
+  const other=fixture();other.scan.root='E:\\';assert.equal(compareSnapshots(before,other).compatible,false);
+  other.scan.root=before.scan.root;other.scan.measurement='allocated-bytes';assert.equal(compareSnapshots(before,other).compatible,false);
+});
+
+test('ordinary recommendations use evidence and keep mixed application data out of cleanup claims',()=>{
+  const m=createReportModel(fixture());
+  assert.deepEqual(m.recommendations.map(r=>r.id),['check','official','relocate','keep']);
+  const check=m.recommendations.find(r=>r.id==='check');assert.ok(check.items.every(row=>!row.path.endsWith('AppData')));
+  assert.match(m.recommendations.find(r=>r.id==='keep').description,/保留|保护/);
+});
+
+
+test('building a homepage model does not eagerly filter and sort the entire directory list',()=>{
+  const f=fixture();let calls=0;
+  f.scan.directories.filter=function(...args){calls++;return Array.prototype.filter.apply(this,args);};
+  const m=createReportModel(f);
+  assert.equal(calls,0);
+  m.getDirectoryRows('',80);assert.equal(calls,1);
+  m.getDirectoryRows('appdata',80);m.getDirectoryRows('windows',80);assert.equal(calls,1);
+});
+
+test('nested cache records stay visible but their summary does not double count parent bytes',()=>{
+  const f=fixture();f.scan.directories.push({id:'nested',parentId:'n',path:f.scan.directories[3].path+'\\nested',bytes:2,ownBytes:2});
+  f.caches=[{id:'npm',path:f.scan.directories[3].path,defaultPath:f.scan.directories[3].path,exists:true},{id:'pip',path:f.scan.directories.at(-1).path,defaultPath:f.scan.directories.at(-1).path,exists:true}];
+  const m=createReportModel(f);assert.equal(m.candidates.length,2);assert.equal(m.cacheSummary.totalBytes,10);
+});
+
+
+test('unknown inventory existence stays unknown and cannot be selected for planning',()=>{
+  for(const exists of [null,undefined]){
+    const f=fixture();
+    const path='C:\\Users\\Sample\\AppData\\Local\\pip\\Cache';
+    f.caches=[{id:'pip',path,defaultPath:path,exists,bytes:200,source:'default'}];
+    const model=createReportModel(f),candidate=model.candidates.find(item=>item.tool==='pip');
+    assert.equal(candidate.exists,null);assert.equal(candidate.eligible,false);assert.equal(candidate.bytes,null);
+    assert.equal(model.cacheSummary.totalBytes,10);
+    assert.throws(()=>migrationProposal(candidate,{path:'E:\\',isSystem:false}),/用途|混合|核验/);
+  }
+  const f=fixture();f.caches=[{id:'npm',path:f.scan.directories[3].path,defaultPath:f.scan.directories[3].path,exists:null}];
+  const candidate=createReportModel(f).candidates.find(item=>item.tool==='npm');
+  assert.equal(candidate.exists,true);assert.equal(candidate.eligible,true);assert.equal(candidate.bytes,10);
 });

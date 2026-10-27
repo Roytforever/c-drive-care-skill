@@ -20,6 +20,7 @@ FILES = {
     'run.py': 'runtime/run.py',
     'scripts/skill_doctor.py': 'runtime/doctor.py',
     'scripts/generate_report.py': 'runtime/scripts/generate_report.py',
+    'scripts/cache_inventory.py': 'runtime/scripts/cache_inventory.py',
     'server/scan-worker.py': 'runtime/server/scan-worker.py',
     'report-assets/template.html': 'runtime/report-assets/template.html',
     'LICENSE': 'LICENSE',

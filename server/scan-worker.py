@@ -123,20 +123,112 @@ def validate_root(root):
     return normalized
 
 
+
+class AllocationReader:
+    """Optional, metadata-only measurement. No elevation or following links."""
+    def __init__(self):
+        if os.name != "nt":
+            return
+        import ctypes
+        from ctypes import wintypes
+        self.ctypes = ctypes
+        self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        class HandleInfo(ctypes.Structure):
+            _fields_ = [("attributes", wintypes.DWORD), ("created", wintypes.FILETIME),
+                        ("accessed", wintypes.FILETIME), ("modified", wintypes.FILETIME),
+                        ("volume", wintypes.DWORD), ("sizeHigh", wintypes.DWORD), ("sizeLow", wintypes.DWORD),
+                        ("links", wintypes.DWORD), ("idHigh", wintypes.DWORD), ("idLow", wintypes.DWORD)]
+        class StandardInfo(ctypes.Structure):
+            _fields_ = [("allocationSize", ctypes.c_longlong), ("endOfFile", ctypes.c_longlong),
+                        ("links", wintypes.DWORD), ("deletePending", ctypes.c_ubyte), ("directory", ctypes.c_ubyte)]
+        class CompressionInfo(ctypes.Structure):
+            _fields_ = [("compressedSize", ctypes.c_longlong), ("format", wintypes.WORD),
+                        ("unitShift", ctypes.c_ubyte), ("chunkShift", ctypes.c_ubyte),
+                        ("clusterShift", ctypes.c_ubyte), ("reserved", ctypes.c_ubyte * 3)]
+        class FileIdInfo(ctypes.Structure):
+            _fields_ = [("volume", ctypes.c_ulonglong), ("identifier", ctypes.c_ubyte * 16)]
+        self.HandleInfo, self.StandardInfo, self.CompressionInfo = HandleInfo, StandardInfo, CompressionInfo
+        self.FileIdInfo = FileIdInfo
+        self.kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                                           wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        self.kernel.CreateFileW.restype = wintypes.HANDLE
+        self.kernel.GetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.POINTER(HandleInfo)]
+        self.kernel.GetFileInformationByHandle.restype = wintypes.BOOL
+        self.kernel.GetFileInformationByHandleEx.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        self.kernel.GetFileInformationByHandleEx.restype = wintypes.BOOL
+        self.kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        self.kernel.CloseHandle.restype = wintypes.BOOL
+
+    def measure(self, path, expected_size):
+        if os.name != "nt":
+            info = os.stat(filesystem_path(path), follow_symlinks=False)
+            if not stat.S_ISREG(info.st_mode) or info.st_size != expected_size:
+                raise ValueError("File changed during allocation measurement")
+            if not info.st_ino or not hasattr(info, "st_blocks"):
+                raise ValueError("Stable file identity or allocated-block information unavailable")
+            return (info.st_dev, info.st_ino), info.st_blocks * 512
+        ctypes, kernel = self.ctypes, self.kernel
+        # FILE_READ_ATTRIBUTES, shared read/write/delete, OPEN_EXISTING,
+        # FILE_FLAG_OPEN_REPARSE_POINT. A metadata handle never reads file content.
+        handle = kernel.CreateFileW(filesystem_path(path), 0x80, 7, None, 3, 0x00200000, None)
+        if handle == ctypes.c_void_p(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            info = self.HandleInfo()
+            if not kernel.GetFileInformationByHandle(handle, ctypes.byref(info)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if info.attributes & (REPARSE | OFFLINE | 0x10):
+                raise ValueError("Allocation target became a reparse, offline, or non-file entry")
+            size = (info.sizeHigh << 32) | info.sizeLow
+            file_id = self.FileIdInfo()
+            if not kernel.GetFileInformationByHandleEx(handle, 18, ctypes.byref(file_id), ctypes.sizeof(file_id)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            # FileIdInfo retains the full 128-bit identity on filesystems such as ReFS.
+            identity = (file_id.volume, bytes(file_id.identifier))
+            if size != expected_size or not any(file_id.identifier):
+                raise ValueError("File changed or stable file identity unavailable")
+            standard = self.StandardInfo()
+            if not kernel.GetFileInformationByHandleEx(handle, 1, ctypes.byref(standard), ctypes.sizeof(standard)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            allocated = standard.allocationSize
+            if info.attributes & (0x800 | 0x200):  # compressed or sparse
+                compression = self.CompressionInfo()
+                if not kernel.GetFileInformationByHandleEx(handle, 8, ctypes.byref(compression), ctypes.sizeof(compression)):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                allocated = compression.compressedSize
+            if allocated < 0:
+                raise ValueError("Invalid allocated byte count")
+            return identity, allocated
+        finally:
+            kernel.CloseHandle(handle)
+
+
 def main():
     config = json.loads(sys.stdin.readline())
     max_dirs = max(1, min(int(config.get("maxDirectories", 500000)), 500000))
     max_display_dirs = max(1, min(int(config.get("maxDisplayDirectories", 20000)), 500000))
     max_files = 500
+    measure_allocated = config.get("measureAllocated") is True
+    max_allocation_files = max(1, min(int(config.get("maxAllocationFiles", 500000)), 3000000))
+    max_per_directory = max(1, min(int(config.get("maxFilesPerDirectory", 20)), 100))
+    max_file_details = max(1, min(int(config.get("maxFileDetails", 100000)), 100000))
     max_entries = 3000000
     max_seconds = 1800
     state = {"status": "running", "root": config["root"], "filesCount": 0, "dirsCount": 0,
              "totalBytes": 0, "errors": 0, "skipped": 0, "errorDetails": [], "skipDetails": [],
              "startedAt": utc(), "finishedAt": None, "currentPath": config["root"],
              "complete": False, "truncated": False, "displayPruned": False, "displayOmittedDirectories": 0,
-             "warnings": [], "directories": [], "largeFiles": [],
+             "warnings": [], "directories": [], "largeFiles": [], "fileDetails": [],
              "limits": {"maxDirectories": max_dirs, "maxLargeFiles": max_files, "maxEntries": max_entries,
-                        "maxSeconds": max_seconds, "maxDisplayDirectories": max_display_dirs}, "measurement": "logical-bytes"}
+                        "maxSeconds": max_seconds, "maxDisplayDirectories": max_display_dirs,
+                        "maxFileDetails": max_file_details, "maxFilesPerDirectory": max_per_directory}, "measurement": "logical-bytes"}
+    allocation = {"requested": measure_allocated, "status": "not-measured", "allocatedBytes": None,
+                  "deduplicatedLogicalBytes": None, "knownAllocatedBytes": 0, "knownDeduplicatedLogicalBytes": 0,
+                  "measuredFiles": 0, "uniqueFiles": 0, "duplicatePaths": 0, "errors": 0, "omittedFiles": 0,
+                  "scope": "scan-root", "attribution": "first-seen-path", "maxFiles": max_allocation_files}
+    state["allocation"] = allocation
+    allocation_reader = AllocationReader() if measure_allocated else None
+    identities = set()
     nodes = []
     largest = []
     summary = IssueSummary()
@@ -144,6 +236,8 @@ def main():
     last_emit = started
     visited = 0
     iterators = []
+    current_index = 0
+    retained_files = 0
 
     def listen():
         for line in sys.stdin:
@@ -160,6 +254,8 @@ def main():
         key = "skipped" if skip else "errors"
         details = "skipDetails" if skip else "errorDetails"
         state[key] += 1
+        if nodes:
+            nodes[current_index]["directSkipped" if skip else "directErrors"] += 1
         if code is None:
             code, label = error_category(reason)
         summary.add(key, code, label, directory if directory is not None else os.path.dirname(path))
@@ -170,7 +266,8 @@ def main():
         root = validate_root(config["root"])
         state["root"] = root
         root_node = {"id": "root", "parentId": None, "path": root, "name": os.path.basename(root) or root,
-                     "bytes": 0, "ownBytes": 0, "_depth": 0}
+                     "bytes": 0, "ownBytes": 0, "ownFileCount": 0, "fileDetailsCount": 0,
+                     "directErrors": 0, "directSkipped": 0, "_depth": 0, "_seen": 0, "_enumerated": False}
         nodes.append(root_node)
         state["dirsCount"] = 1
         # Directory iterators bound memory to directory depth; no recursive call stack.
@@ -182,9 +279,11 @@ def main():
                 state["warnings"].append("已达到扫描条目或时间上限，当前结果仅代表已扫描部分。")
                 break
             index, iterator = iterators[-1]
+            current_index = index
             try:
                 entry = next(iterator)
             except StopIteration:
+                nodes[index]["_enumerated"] = True
                 iterator.close()
                 iterators.pop()
                 continue
@@ -194,6 +293,7 @@ def main():
                 iterators.pop()
                 continue
             visited += 1
+            nodes[index]["_seen"] += 1
             display_path = os.path.join(nodes[index]["path"], entry.name)
             issue_directory = nodes[index]["path"]
             state["currentPath"] = display_path
@@ -216,7 +316,9 @@ def main():
                     child_iterator = os.scandir(filesystem_path(display_path))
                     child_index = len(nodes)
                     nodes.append({"id": str(child_index), "parentId": nodes[index]["id"], "path": display_path,
-                                  "name": entry.name, "bytes": 0, "ownBytes": 0, "_parent": index, "_depth": nodes[index]["_depth"] + 1})
+                                  "name": entry.name, "bytes": 0, "ownBytes": 0, "ownFileCount": 0, "fileDetailsCount": 0,
+                                  "directErrors": 0, "directSkipped": 0, "_seen": 0, "_enumerated": False,
+                                  "_parent": index, "_depth": nodes[index]["_depth"] + 1})
                     state["dirsCount"] += 1
                     iterators.append((child_index, child_iterator))
                 elif stat.S_ISREG(info.st_mode):
@@ -224,15 +326,53 @@ def main():
                     nodes[index]["ownBytes"] += size
                     state["totalBytes"] += size
                     state["filesCount"] += 1
-                    item_kind, protected = kind_for(entry.name)
-                    item = {"path": display_path, "name": entry.name, "bytes": size,
-                            "modifiedAt": datetime.datetime.fromtimestamp(info.st_mtime, datetime.timezone.utc).isoformat(),
-                            "kind": item_kind, "protected": protected}
-                    heap_item = (size, visited, item)
-                    if len(largest) < max_files:
-                        heapq.heappush(largest, heap_item)
-                    elif heap_item[:2] > largest[0][:2]:
-                        heapq.heapreplace(largest, heap_item)
+                    node = nodes[index]
+                    node["ownFileCount"] += 1
+                    if measure_allocated:
+                        if allocation["measuredFiles"] + allocation["errors"] >= max_allocation_files:
+                            allocation["omittedFiles"] += 1
+                            node["_allocationErrors"] = node.get("_allocationErrors", 0) + 1
+                        else:
+                            try:
+                                identity, allocated = allocation_reader.measure(display_path, size)
+                                allocation["measuredFiles"] += 1
+                                if identity in identities:
+                                    allocation["duplicatePaths"] += 1
+                                else:
+                                    identities.add(identity)
+                                    allocation["uniqueFiles"] += 1
+                                    allocation["knownAllocatedBytes"] += allocated
+                                    allocation["knownDeduplicatedLogicalBytes"] += size
+                                    node["_ownAllocatedBytes"] = node.get("_ownAllocatedBytes", 0) + allocated
+                            except (OSError, ValueError, OverflowError):
+                                allocation["errors"] += 1
+                                node["_allocationErrors"] = node.get("_allocationErrors", 0) + 1
+                    rank = (size, visited)
+                    global_candidate = len(largest) < max_files or rank > largest[0][:2]
+                    local = node.get("_fileHeap", [])
+                    local_candidate = (len(local) < max_per_directory and retained_files < max_file_details) or (
+                        bool(local) and (len(local) >= max_per_directory or retained_files >= max_file_details) and rank > local[0][:2])
+                    # Most files enter neither bounded index. Avoid date conversion,
+                    # extension classification and record allocation for those files.
+                    if global_candidate or local_candidate:
+                        item_kind, protected = kind_for(entry.name)
+                        item = {"path": display_path, "name": entry.name, "bytes": size, "parentId": node["id"],
+                                "modifiedAt": datetime.datetime.fromtimestamp(info.st_mtime, datetime.timezone.utc).isoformat(),
+                                "kind": item_kind, "protected": protected}
+                        heap_item = (*rank, item)
+                        if global_candidate:
+                            if len(largest) < max_files:
+                                heapq.heappush(largest, heap_item)
+                            else:
+                                heapq.heapreplace(largest, heap_item)
+                        if local_candidate:
+                            if "_fileHeap" not in node:
+                                node["_fileHeap"] = local
+                            if len(local) < max_per_directory and retained_files < max_file_details:
+                                heapq.heappush(local, heap_item)
+                                retained_files += 1
+                            else:
+                                heapq.heapreplace(local, heap_item)
                 else:
                     issue(display_path, "non-regular filesystem entry skipped", True, "nonregular", "其他特殊文件", issue_directory)
             except (OSError, ValueError, OverflowError) as exc:
@@ -258,9 +398,31 @@ def main():
             iterator.close()
         for node in reversed(nodes):
             node["bytes"] += node["ownBytes"]
+            errors = node["directErrors"] + node.pop("_childErrors", 0)
+            skipped = node["directSkipped"] + node.pop("_childSkipped", 0)
+            child_partial = node.pop("_childPartial", False)
+            complete = node["_enumerated"] and not errors and not skipped and not child_partial
+            node["coverage"] = {"status": "complete" if complete else (
+                "unscanned" if not node["_seen"] and not errors and not skipped else "partial"), "errors": errors, "skipped": skipped}
+            if measure_allocated:
+                own_allocated = node.pop("_ownAllocatedBytes", 0)
+                direct_allocation_errors = node.pop("_allocationErrors", 0)
+                allocation_errors = direct_allocation_errors + node.pop("_childAllocationErrors", 0)
+                known_allocated = own_allocated + node.pop("_childAllocatedBytes", 0)
+                node["ownAllocatedBytes"] = own_allocated if node["_enumerated"] and not node["directErrors"] and not node["directSkipped"] and not direct_allocation_errors else None
+                node["knownAllocatedBytes"] = known_allocated
+                node["allocatedBytes"] = known_allocated if complete and not allocation_errors else None
             parent = node.pop("_parent", None)
             if parent is not None:
+                if measure_allocated:
+                    nodes[parent]["_childAllocatedBytes"] = nodes[parent].get("_childAllocatedBytes", 0) + known_allocated
+                    nodes[parent]["_childAllocationErrors"] = nodes[parent].get("_childAllocationErrors", 0) + allocation_errors
                 nodes[parent]["bytes"] += node["bytes"]
+                nodes[parent]["_childErrors"] = nodes[parent].get("_childErrors", 0) + errors
+                nodes[parent]["_childSkipped"] = nodes[parent].get("_childSkipped", 0) + skipped
+                nodes[parent]["_childPartial"] = nodes[parent].get("_childPartial", False) or not complete
+            node.pop("_seen", None)
+            node.pop("_enumerated", None)
         if len(nodes) > max_display_dirs:
             # Parent totals are always >= their descendants. A depth tiebreaker
             # preserves ancestor closure even for chains of equal-sized folders.
@@ -278,8 +440,26 @@ def main():
         for node in displayed:
             if node["parentId"] in by_id:
                 by_id[node["parentId"]]["omittedBytes"] -= node["bytes"]
-        for node in displayed:
+        file_details = []
+        for node in nodes:
+            details = node.pop("_fileHeap", [])
+            if node["id"] in by_id:
+                node["fileDetailsCount"] = len(details)
+                file_details.extend(item[2] for item in sorted(details, reverse=True))
             node.pop("_depth", None)
+        state["fileDetails"] = file_details
+        state["fileDetailPolicy"] = {"maxPerDirectory": max_per_directory, "maxTotal": max_file_details,
+                                     "retained": len(file_details), "omitted": max(0, state["filesCount"] - len(file_details))}
+        if measure_allocated:
+            allocation_complete = state["complete"] and not allocation["errors"] and not allocation["omittedFiles"]
+            allocation["status"] = "complete" if allocation_complete else (
+                "partial" if allocation["measuredFiles"] else "unavailable")
+            if allocation_complete:
+                allocation["allocatedBytes"] = allocation["knownAllocatedBytes"]
+                allocation["deduplicatedLogicalBytes"] = allocation["knownDeduplicatedLogicalBytes"]
+            state["warnings"].append("可选分配量仅在本次扫描范围内按文件身份去重，归属首个遇到的路径；不代表删除某个链接即可释放这些空间。")
+            if not allocation_complete:
+                state["warnings"].append("分配量测量存在遗漏、失败或扫描边界；总分配量保持未知，已测部分单独展示。")
         state["directories"] = displayed
         state["largeFiles"] = [entry[2] for entry in sorted(largest, reverse=True)]
         state["issueSummary"] = summary.finalize()

@@ -247,3 +247,136 @@ test('cache discovery labels defaults and excludes overridden arbitrary director
   assert.equal(caches.find(c => c.id === 'npm').supported, false);
   assert.equal(caches.find(c => c.id === 'npm').source, 'config');
 });
+
+async function scanWorker(config) {
+  return new Promise((resolve, reject) => {
+    const child = execFile('python', ['-I', '-u', path.resolve('server/scan-worker.py')], { windowsHide: true, maxBuffer: 32 * 1024 * 1024 }, (error, stdout, stderr) => {
+      if (error) return reject(new Error(stderr || error.message));
+      try { resolve(JSON.parse(stdout.trim().split('\n').at(-1))); } catch (parseError) { reject(parseError); }
+    });
+    child.stdin.end(JSON.stringify(config) + '\n');
+  });
+}
+
+test('keeps directory file details outside the global Top500 with explicit coverage', async t => {
+  const root = await fixture(t);
+  const small = path.join(root, 'small'); await fs.mkdir(small);
+  for (let i = 0; i < 501; i++) await fs.writeFile(path.join(root, `large-${i}`), Buffer.alloc(10));
+  await fs.writeFile(path.join(small, 'tiny.txt'), Buffer.alloc(1));
+  const state = await scanWorker({ root });
+  assert.equal(state.largeFiles.length, 500);
+  assert.ok(state.largeFiles.every(file => file.path !== path.join(small, 'tiny.txt')));
+  const directory = state.directories.find(row => row.path === small);
+  assert.equal(directory.ownFileCount, 1);
+  assert.equal(directory.fileDetailsCount, 1);
+  assert.equal(directory.coverage.status, 'complete');
+  assert.ok(state.fileDetails.some(file => file.path === path.join(small, 'tiny.txt') && file.parentId === directory.id));
+  assert.equal(state.fileDetailPolicy.retained, 21);
+  assert.equal(state.fileDetailPolicy.omitted, 481);
+  assert.equal(state.fileDetailPolicy.maxPerDirectory, 20);
+});
+
+test('bounds per-directory details and total retention without altering logical totals', async t => {
+  const root = await fixture(t);
+  for (const name of ['a', 'b']) {
+    await fs.mkdir(path.join(root, name));
+    for (let i = 1; i <= 4; i++) await fs.writeFile(path.join(root, name, String(i)), Buffer.alloc(i));
+  }
+  const state = await scanWorker({ root, maxFilesPerDirectory: 2, maxFileDetails: 3 });
+  assert.equal(state.filesCount, 8); assert.equal(state.totalBytes, 20);
+  assert.equal(state.fileDetails.length, 3);
+  assert.equal(state.fileDetailPolicy.retained, 3); assert.equal(state.fileDetailPolicy.omitted, 5);
+  for (const row of state.directories) {
+    const details = state.fileDetails.filter(file => file.parentId === row.id);
+    assert.ok(details.length <= 2); assert.equal(row.fileDetailsCount, details.length);
+  }
+});
+
+test('directory coverage isolates skipped entries from unaffected sibling directories', async t => {
+  const root = await fixture(t);
+  for (const name of ['safe', 'linked']) await fs.mkdir(path.join(root, name));
+  await fs.writeFile(path.join(root, 'safe', 'one'), Buffer.alloc(3));
+  await fs.symlink(path.join(root, 'safe'), path.join(root, 'linked', 'alias'), process.platform === 'win32' ? 'junction' : 'dir');
+  const state = await scanWorker({ root });
+  const safe = state.directories.find(row => row.path === path.join(root, 'safe'));
+  const linked = state.directories.find(row => row.path === path.join(root, 'linked'));
+  assert.deepEqual(safe.coverage, { status: 'complete', errors: 0, skipped: 0 });
+  assert.deepEqual(linked.coverage, { status: 'partial', errors: 0, skipped: 1 });
+  assert.equal(linked.directSkipped, 1);
+  assert.equal(state.directories[0].coverage.status, 'partial');
+  assert.equal(state.directories[0].coverage.skipped, 1);
+});
+
+test('truncated traversal cannot mark unfinished directory coverage complete', async t => {
+  const root = await fixture(t);
+  await fs.mkdir(path.join(root, 'a')); await fs.mkdir(path.join(root, 'b'));
+  const state = await scanWorker({ root, maxDirectories: 1 });
+  assert.equal(state.truncated, true);
+  assert.notEqual(state.directories[0].coverage.status, 'complete');
+});
+
+test('optional allocation measurement deduplicates hardlinks while keeping path logical totals', async t => {
+  const root = await fixture(t);
+  const first = path.join(root, 'original.bin'), second = path.join(root, 'hardlink.bin');
+  await fs.writeFile(first, Buffer.alloc(65536, 1)); await fs.link(first, second);
+  const state = await scanWorker({ root, measureAllocated: true });
+  assert.equal(state.totalBytes, 131072); assert.equal(state.filesCount, 2);
+  assert.equal(state.allocation.requested, true);
+  assert.equal(state.allocation.status, 'complete');
+  assert.equal(state.allocation.uniqueFiles, 1); assert.equal(state.allocation.duplicatePaths, 1);
+  assert.equal(state.allocation.deduplicatedLogicalBytes, 65536);
+  assert.ok(Number.isFinite(state.allocation.allocatedBytes));
+  assert.equal(state.directories[0].allocatedBytes, state.allocation.allocatedBytes);
+});
+
+test('allocation limits produce unknown totals instead of a false zero', async t => {
+  const root = await fixture(t);
+  await fs.writeFile(path.join(root, 'one'), Buffer.alloc(11)); await fs.writeFile(path.join(root, 'two'), Buffer.alloc(13));
+  const state = await scanWorker({ root, measureAllocated: true, maxAllocationFiles: 1 });
+  assert.equal(state.totalBytes, 24);
+  assert.equal(state.allocation.status, 'partial');
+  assert.equal(state.allocation.allocatedBytes, null);
+  assert.equal(state.allocation.omittedFiles, 1);
+  assert.equal(state.allocation.measuredFiles, 1);
+  assert.equal(state.directories[0].allocatedBytes, null);
+});
+
+test('display pruning removes orphan file details while omission counts remain honest', async t => {
+  const root = await fixture(t);
+  const nested = path.join(root, 'nested'); await fs.mkdir(nested);
+  await fs.writeFile(path.join(root, 'one'), Buffer.alloc(2)); await fs.writeFile(path.join(nested, 'two'), Buffer.alloc(3));
+  const state = await scanWorker({ root, maxDisplayDirectories: 1 });
+  assert.equal(state.directories.length, 1); assert.equal(state.filesCount, 2);
+  assert.equal(state.fileDetails.length, 1); assert.equal(state.fileDetails[0].parentId, 'root');
+  assert.equal(state.fileDetailPolicy.omitted, 1); assert.equal(state.fileDetailPolicy.retained, 1);
+});
+
+test('optional allocation measures sparse storage separately from logical length', { skip: process.platform !== 'win32' }, async t => {
+  const root = await fixture(t), file = path.join(root, 'sparse.bin');
+  await fs.writeFile(file, Buffer.alloc(0));
+  const source = `import ctypes,os,sys,msvcrt
+fd=os.open(sys.argv[1],os.O_RDWR|os.O_BINARY)
+k=ctypes.WinDLL('kernel32',use_last_error=True)
+k.DeviceIoControl.argtypes=[ctypes.c_void_p,ctypes.c_ulong,ctypes.c_void_p,ctypes.c_ulong,ctypes.c_void_p,ctypes.c_ulong,ctypes.c_void_p,ctypes.c_void_p]
+returned=ctypes.c_ulong()
+try:
+    ok=k.DeviceIoControl(msvcrt.get_osfhandle(fd),0x900c4,None,0,None,0,ctypes.byref(returned),None)
+    if not ok: raise OSError('sparse files unsupported on temporary volume')
+    os.ftruncate(fd,16*1024*1024)
+finally: os.close(fd)`;
+  try { await promisify(execFile)('python', ['-I', '-c', source, file], { windowsHide: true }); }
+  catch { t.skip('temporary filesystem does not support sparse files'); return; }
+  const state = await scanWorker({ root, measureAllocated: true });
+  assert.equal(state.totalBytes, 16 * 1024 * 1024);
+  assert.equal(state.allocation.status, 'complete');
+  assert.ok(state.allocation.allocatedBytes < state.totalBytes);
+});
+
+test('clamps configured file detail limits to the shared 100000-record schema', async t => {
+  const root = await fixture(t);
+  await fs.writeFile(path.join(root, 'one.txt'), Buffer.alloc(1));
+  const state = await scanWorker({ root, maxFileDetails: 200000 });
+  assert.equal(state.fileDetailPolicy.maxTotal, 100000);
+  assert.equal(state.limits.maxFileDetails, 100000);
+  assert.equal(state.fileDetails.length, 1);
+});

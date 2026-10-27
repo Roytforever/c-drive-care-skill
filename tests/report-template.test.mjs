@@ -9,6 +9,7 @@ test('standalone template runs its inline app only after the root and data slot 
   assert.equal(/<script[^>]+src=/.test(html),false);
   assert.equal(/<link[^>]+rel="stylesheet"/.test(html),false);
   assert.ok(html.includes("connect-src 'none'"));
+  assert.ok(html.includes('worker-src blob:'),'Offline data reader must be permitted without external worker files');
   const licenses=html.match(/<pre hidden id="liubai-licenses">([\s\S]*?)<\/pre>/)?.[1]||'';
   assert.match(licenses,/scheduler\s+MIT License/,'Bundled scheduler attribution must be present in the standalone artifact');
 });

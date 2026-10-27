@@ -45,6 +45,7 @@ class SkillPackageTests(unittest.TestCase):
             'liubai-storage/runtime/run.py',
             'liubai-storage/runtime/doctor.py',
             'liubai-storage/runtime/scripts/generate_report.py',
+            'liubai-storage/runtime/scripts/cache_inventory.py',
             'liubai-storage/runtime/server/scan-worker.py',
             'liubai-storage/runtime/report-assets/template.html',
         }
@@ -165,7 +166,7 @@ class SkillPackageTests(unittest.TestCase):
         self.assertEqual(sentinel.read_text(encoding='utf-8'), 'preserve')
         conflict = json.loads(repeated.stdout or repeated.stderr)
         self.assertEqual(conflict['status'], 'conflict')
-        self.assertEqual(conflict['existingVersion'], '0.1.0')
+        self.assertEqual(conflict['existingVersion'], '0.2.0')
 
     def test_installer_rejects_targets_within_source_or_symlink(self):
         archive = self.root / 'release.zip'

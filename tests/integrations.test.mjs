@@ -192,6 +192,19 @@ test('CLI report parses booleans and works with no HTTP service configuration',a
   assert.match(await fs.readFile(path.join(out,'report.html'),'utf8'),/liubai-report-data/);
 });
 
+test('optional allocation measurement is explicit and cannot run while rebuilding a snapshot',async t=>{
+  const r=await reportFixture(t),client=createClient();
+  await assert.rejects(()=>client.callTool('liubai_report',{index:r.input,reportOnly:true,measureAllocated:true,outDir:path.join(r.root,'rejected')}),/快照|分配量/);
+  await assert.rejects(()=>client.callTool('liubai_report',{root:r.root,measureAllocated:'true'}),/boolean|布尔|measureAllocated/);
+  const input=path.join(r.root,'allocation-input');await fs.mkdir(input);await fs.writeFile(path.join(input,'one.txt'),'synthetic file');
+  const result=await client.callTool('liubai_report',{root:input,outDir:path.join(r.root,'allocation-report'),measureAllocated:true});
+  const state=JSON.parse(await fs.readFile(result.index,'utf8'));
+  assert.equal(state.scan.allocation.requested,true);
+  assert.equal(state.scan.filesCount,1);
+  assert.equal(state.scan.fileDetails.length,1);
+  assert.equal(state.scan.directories[0].coverage.status,'complete');
+});
+
 test('static report bridge protects existing outputs unless overwrite is explicitly requested',async t=>{
   const r=await reportFixture(t),out=path.join(r.root,'protected output');
   const client=createClient();

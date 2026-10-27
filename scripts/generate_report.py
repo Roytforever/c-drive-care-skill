@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import copy
 import datetime as dt
 import json
 import gzip
@@ -15,6 +14,18 @@ import subprocess
 import sys
 import tempfile
 import webbrowser
+
+if __package__:
+    from .cache_inventory import discover_caches
+else:
+    # Support direct script/runpy execution without searching the working
+    # directory or relying on a host-specific import path.
+    import importlib.util
+    _inventory_spec = importlib.util.spec_from_file_location(
+        '_liubai_cache_inventory', Path(__file__).resolve().with_name('cache_inventory.py'))
+    _inventory_module = importlib.util.module_from_spec(_inventory_spec)
+    _inventory_spec.loader.exec_module(_inventory_module)
+    discover_caches = _inventory_module.discover_caches
 
 PROJECT = Path(__file__).resolve().parents[1]
 DATA_MARKER = '<!--LIUBAI_REPORT_DATA-->'
@@ -39,8 +50,11 @@ def sanitize(value):
 
 def safe_json(value):
     # JSON-in-HTML must not contain any raw closing tag or JS line separator.
-    return (json.dumps(value, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
-            .replace('&', '\\u0026').replace('<', '\\u003c').replace('>', '\\u003e')
+    return escape_json(json.dumps(value, ensure_ascii=False, separators=(',', ':'), allow_nan=False))
+
+
+def escape_json(serialized):
+    return (serialized.replace('&', '\\u0026').replace('<', '\\u003c').replace('>', '\\u003e')
             .replace('\u2028', '\\u2028').replace('\u2029', '\\u2029'))
 
 
@@ -113,6 +127,14 @@ def validate_scan(scan):
             value = node.get(key, 0)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
                 raise ValueError('扫描快照目录体积无效')
+        for key in ('ownFileCount', 'fileDetailsCount', 'directErrors', 'directSkipped'):
+            if key in node and (type(node[key]) is not int or node[key] < 0):
+                raise ValueError('扫描快照目录计数无效: ' + key)
+        if 'coverage' in node:
+            coverage = node['coverage']
+            if (not isinstance(coverage, dict) or coverage.get('status') not in ('complete', 'partial', 'unscanned')
+                    or any(type(coverage.get(k)) is not int or coverage[k] < 0 for k in ('errors', 'skipped'))):
+                raise ValueError('扫描快照目录覆盖状态无效')
     if scan['directories']:
         by_id = {node['id']: node for node in scan['directories']}
         if sum(node.get('parentId') is None for node in scan['directories']) != 1:
@@ -140,6 +162,39 @@ def validate_scan(scan):
         value = item.get('bytes')
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
             raise ValueError('扫描快照文件体积无效')
+    if 'fileDetails' in scan:
+        details = scan['fileDetails']
+        if not isinstance(details, list) or len(details) > 100000:
+            raise ValueError('扫描快照文件明细格式或数量无效')
+        by_id = {node['id']: node for node in scan['directories']}
+        counts = {}
+        paths = set()
+        normalize = lambda path: path.replace('\\', '/').rstrip('/').casefold()
+        for item in details:
+            if not isinstance(item, dict) or not isinstance(item.get('path'), str) or not item['path']:
+                raise ValueError('扫描快照文件明细路径无效')
+            parent = item.get('parentId')
+            if not isinstance(parent, str) or parent not in by_id:
+                raise ValueError('扫描快照文件明细缺少父目录')
+            path = normalize(item['path'])
+            if '/' not in path or path.rsplit('/', 1)[0] != normalize(by_id[parent]['path']) or path in paths:
+                raise ValueError('扫描快照文件明细位置与父目录不一致或重复')
+            value = item.get('bytes')
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                raise ValueError('扫描快照文件明细体积无效')
+            paths.add(path)
+            counts[parent] = counts.get(parent, 0) + 1
+        for node in scan['directories']:
+            if 'fileDetailsCount' in node and node['fileDetailsCount'] != counts.get(node['id'], 0):
+                raise ValueError('扫描快照目录文件明细数量不一致')
+            if 'ownFileCount' in node and node['ownFileCount'] < counts.get(node['id'], 0):
+                raise ValueError('扫描快照文件明细多于目录文件数量')
+        if 'fileDetailPolicy' in scan:
+            policy = scan['fileDetailPolicy']
+            keys = ('maxPerDirectory', 'maxTotal', 'retained', 'omitted')
+            if (not isinstance(policy, dict) or any(type(policy.get(k)) is not int or policy[k] < 0 for k in keys)
+                    or policy['retained'] != len(details) or policy['retained'] > policy['maxTotal']):
+                raise ValueError('扫描快照文件明细策略无效')
 
 
 def normalize_snapshot(payload, source_mode='snapshot'):
@@ -147,8 +202,9 @@ def normalize_snapshot(payload, source_mode='snapshot'):
         raise ValueError('索引应为 JSON 对象')
     scan = payload.get('scan') if 'scan' in payload else payload
     validate_scan(scan)
-    full = copy.deepcopy(payload) if 'scan' in payload else {'scan': copy.deepcopy(scan)}
-    full = sanitize(full)
+    # sanitize already creates each dictionary/list once; a preceding deepcopy
+    # doubled peak memory without adding isolation for JSON snapshots.
+    full = sanitize(payload if 'scan' in payload else {'scan': scan})
     full['version'] = '2.0-static'
     full['generatedAt'] = utc_now()
     full['sourceMode'] = source_mode
@@ -184,8 +240,8 @@ def read_template(template_path):
     return document
 
 
-def render_report(template, state, compress=True):
-    serialized = safe_json(state)
+def render_report(template, state, compress=True, *, serialized=None):
+    serialized = safe_json(state) if serialized is None else escape_json(serialized)
     raw = serialized.encode('utf-8')
     if compress and len(raw) > 1024 * 1024:
         encoded = base64.b64encode(gzip.compress(raw, compresslevel=6, mtime=0)).decode('ascii')
@@ -261,40 +317,11 @@ def inventory(scan):
                        'totalBytes': stats.f_blocks * stats.f_frsize, 'freeBytes': stats.f_bavail * stats.f_frsize}]
         except (OSError, AttributeError) as error:
             warnings.append('无法读取卷容量；保留未知值: ' + str(error)[:200])
-    home = Path.home()
-    local = Path(env_value('LOCALAPPDATA', str(home / 'AppData' / 'Local')))
-    definitions = [('npm', 'npm 缓存', local / 'npm-cache', 'NPM_CONFIG_CACHE'),
-                   ('pip', 'pip 缓存', local / 'pip' / 'Cache', 'PIP_CACHE_DIR'),
-                   ('uv', 'uv 缓存', local / 'uv' / 'cache', 'UV_CACHE_DIR'),
-                   ('pnpm', 'pnpm store', local / 'pnpm' / 'store', ''),
-                   ('gradle', 'Gradle 缓存', Path(env_value('GRADLE_USER_HOME', str(home / '.gradle'))) / 'caches', ''),
-                   ('playwright', 'Playwright 浏览器', local / 'ms-playwright', 'PLAYWRIGHT_BROWSERS_PATH'),
-                   ('maven', 'Maven 本地仓库', home / '.m2' / 'repository', '')]
-    by_path = {os.path.normcase(os.path.abspath(node['path'])): node for node in scan['directories']}
-    caches = []
-    for key, name, default, env_key in definitions:
-        configured = env_value(env_key) if env_key else None
-        location = os.path.expandvars(os.path.expanduser(configured or str(default)))
-        node = by_path.get(os.path.normcase(os.path.abspath(location)))
-        item = {'id': key, 'name': name, 'path': location, 'defaultPath': str(default),
-                'envKey': env_key, 'bytes': node['bytes'] if node else None,
-                'exists': bool(node), 'supported': False,
-                'source': 'environment' if configured else 'default',
-                'sizeIsPartial': not scan.get('complete', False),
-                'warnings': ['静态报告只提供规划；默认路径或环境值不代表已核验工具当前生效配置。']}
-        if key == 'maven':
-            item['warnings'].append('可能含未发布私有构件，不能作为通用可重建缓存删除。')
-        try:
-            info = os.lstat(location)
-            if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode) and not getattr(info, 'st_file_attributes', 0) & 0x400:
-                item['exists'] = True
-        except OSError:
-            pass
-        caches.append(item)
+    caches = discover_caches(scan)
     return {'drives': drives, 'caches': caches, 'report': {'inventoryWarnings': warnings}}
 
 
-def scan_directory(root, max_directories=500000, max_display_directories=500000):
+def scan_directory(root, max_directories=500000, max_display_directories=500000, *, measure_allocated=False):
     root = os.path.abspath(root)
     worker = PROJECT / 'server' / 'scan-worker.py'
     process = subprocess.Popen([sys.executable, '-I', '-u', str(worker)], stdin=subprocess.PIPE,
@@ -303,7 +330,8 @@ def scan_directory(root, max_directories=500000, max_display_directories=500000)
     last = None
     try:
         process.stdin.write(json.dumps({'root': root, 'maxDirectories': max_directories,
-                                       'maxDisplayDirectories': max_display_directories}) + '\n')
+                                       'maxDisplayDirectories': max_display_directories,
+                                       'measureAllocated': measure_allocated}) + '\n')
         process.stdin.flush()
         for line in process.stdout:
             update = json.loads(line)
@@ -351,6 +379,7 @@ def main(argv=None):
     parser.add_argument('--template', type=Path, default=PROJECT / 'report-assets' / 'template.html', help='预构建的单文件报告模板')
     parser.add_argument('--max-directories', type=int, default=500000, help='扫描目录上限，1–500000')
     parser.add_argument('--max-display-directories', type=int, default=500000, help='报告保留的目录数量，1–500000')
+    parser.add_argument('--measure-allocated', action='store_true', help='额外只读测量分配空间与硬链接身份；更慢，不代表可释放量')
     parser.add_argument('--open', action='store_true', help='生成后用系统默认浏览器打开本地 HTML')
     parser.add_argument('--no-compress', action='store_true', help='不压缩内嵌数据，供不支持浏览器内置 gzip 解压的旧浏览器使用')
     parser.add_argument('--overwrite', action='store_true', help='允许替换已有输出；已有输入索引仍保留')
@@ -358,6 +387,8 @@ def main(argv=None):
     try:
         if not 1 <= args.max_directories <= 500000 or not 1 <= args.max_display_directories <= 500000:
             raise ValueError('目录上限必须在 1–500000 之间')
+        if args.report_only and args.measure_allocated:
+            raise ValueError('--measure-allocated 仅用于新扫描，不能对旧快照冒充当前测量')
         if args.report_only and not args.index:
             raise ValueError('--report-only 必须提供 --index')
         if not args.report_only and args.index:
@@ -384,14 +415,16 @@ def main(argv=None):
         else:
             if not os.path.isabs(args.volume):
                 raise ValueError('请提供待扫描目录的本地绝对路径')
-            scan = scan_directory(args.volume, args.max_directories, args.max_display_directories)
+            scan = scan_directory(args.volume, args.max_directories, args.max_display_directories,
+                                  measure_allocated=args.measure_allocated)
             state = normalize_snapshot({'scan': scan, **inventory(scan)}, source_mode='scan')
-        document = render_report(template, state, compress=not args.no_compress)
+        serialized = json.dumps(state, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
+        document = render_report(template, state, compress=not args.no_compress, serialized=serialized)
         output.mkdir(parents=True, exist_ok=True)
         published = []
         try:
             if not source_is_index:
-                atomic_write(index_path, json.dumps(state, ensure_ascii=False, separators=(',', ':'), allow_nan=False),
+                atomic_write(index_path, serialized,
                              overwrite=args.overwrite)
                 published.append(index_path)
             atomic_write(report_path, document, overwrite=args.overwrite)

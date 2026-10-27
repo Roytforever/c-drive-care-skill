@@ -2,7 +2,7 @@
 import { createClient } from './client.mjs';
 
 const commands = { report: 'liubai_report', status: 'liubai_status', caches: 'liubai_caches', files: 'liubai_files', scan: 'liubai_scan', cancel: 'liubai_cancel_scan', plan: 'liubai_plan' };
-const usage = 'node integrations/cli.mjs report [--root C:\\] [--outDir report] [--overwrite true] | report --index index.json --reportOnly true | status | caches | files [--limit 25] [--offset 0] | scan --root C:\\ | cancel | plan --kind migrate --cacheId npm --driveId E:';
+const usage = 'node integrations/cli.mjs report [--root C:\\] [--outDir report] [--overwrite true] [--measureAllocated true] | report --index index.json --reportOnly true | status | caches | files [--limit 25] [--offset 0] | scan --root C:\\ | cancel | plan --kind migrate --cacheId npm --driveId E:';
 
 try {
   const [command, ...parts] = process.argv.slice(2);
@@ -16,7 +16,7 @@ try {
       const flag = parts[index], value = parts[index + 1];
       if (!/^--[A-Za-z][A-Za-z0-9]*$/.test(flag) || value === undefined || Object.hasOwn(input, flag.slice(2))) throw new Error('参数必须成对提供，且不能重复，例如 --root "C:\\Users"');
       const key = flag.slice(2);
-      if (key === 'reportOnly' || key === 'overwrite') {
+      if (key === 'reportOnly' || key === 'overwrite' || key === 'measureAllocated') {
         if (!['true','false'].includes(value)) throw new Error(`--${key} 必须为 true 或 false`);
         input[key] = value === 'true';
       } else input[key] = ['offset', 'limit'].includes(key) ? Number(value) : value;

@@ -10,8 +10,11 @@ const project = fileURLToPath(new URL('..', import.meta.url));
 export async function generateStaticReport(input = {}) {
   const reportOnly = input.reportOnly ?? false;
   const overwrite = input.overwrite ?? false;
+  const measureAllocated = input.measureAllocated ?? false;
   if (typeof reportOnly !== 'boolean') throw new Error('reportOnly 必须为布尔值');
   if (typeof overwrite !== 'boolean') throw new Error('overwrite 必须为布尔值');
+  if (typeof measureAllocated !== 'boolean') throw new Error('measureAllocated 必须为布尔值');
+  if (reportOnly && measureAllocated) throw new Error('快照重建不能请求当前分配量测量');
   if (reportOnly && !input.index) throw new Error('reportOnly 必须提供 index 索引路径');
   if (reportOnly && input.root) throw new Error('快照重建不能同时指定 root 扫描路径');
   if (input.index && !reportOnly) throw new Error('读取已有 index 时请设置 reportOnly:true，避免误启动扫描');
@@ -24,6 +27,7 @@ export async function generateStaticReport(input = {}) {
   }
   args.push('--out-dir', input.outDir ? path.resolve(input.outDir) : path.join(project, 'report'));
   if (overwrite) args.push('--overwrite');
+  if (measureAllocated) args.push('--measure-allocated');
   let output;
   try {
     output = await run('python', args, { cwd: project, windowsHide: true, encoding: 'utf8',

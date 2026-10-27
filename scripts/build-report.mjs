@@ -20,7 +20,7 @@ html=html.replace('</body>',()=>`<pre hidden id="liubai-licenses">${licenseText}
 html=html.replace('</head>',()=>`<style>${css.replace(/<\/style/gi,'<\\/style')}</style></head>`);
 html=html.replace(/<link\b[^>]*rel="icon"[^>]*>/g,'');
 html=html.replace(/<meta name="description"[^>]*>/,'<meta name="description" content="留白 · 自包含静态磁盘报告。离线浏览、下钻、筛选与导出建议。">');
-html=html.replace('<head>','<head>\n<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; script-src \'unsafe-inline\'; style-src \'unsafe-inline\'; img-src data:; connect-src \'none\'; base-uri \'none\'; form-action \'none\'; object-src \'none\'">');
+html=html.replace('<head>','<head>\n<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; script-src \'unsafe-inline\'; worker-src blob:; style-src \'unsafe-inline\'; img-src data:; connect-src \'none\'; base-uri \'none\'; form-action \'none\'; object-src \'none\'">');
 html=html.replace(/(<\/title>)[ \t]+\n[ \t]+\n/, '$1\n\n');
 if(!html.includes('<!--LIUBAI_REPORT_DATA-->'))throw new Error('Snapshot marker missing');
 await fs.mkdir(path.join(root,'report-assets'),{recursive:true});

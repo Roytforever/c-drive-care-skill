@@ -7,7 +7,7 @@ node integrations/cli.mjs report --root 'C:\' --outDir report
 node integrations/cli.mjs report --index report/index.json --reportOnly true --outDir report-refreshed
 ```
 
-返回 report/index 的绝对路径、fileUri、扫描状态和来源。生成后双击 HTML 离线浏览；桥接不会自动打开网页或操作缓存/配置。MCP report 参数为 root、index、outDir、reportOnly、overwrite；reportOnly=true 必须提供 index，overwrite 仅在明确需要替换输出时设为 true，默认拒绝覆盖已有产物。
+返回 report/index 的绝对路径、fileUri、扫描状态和来源。生成后双击 HTML 离线浏览；桥接不会自动打开网页或操作缓存/配置。MCP report 参数为 root、index、outDir、reportOnly、overwrite、measureAllocated；reportOnly=true 必须提供 index，overwrite 仅在明确需要替换输出时设为 true，默认拒绝覆盖已有产物。
 
 WorkBuddy 等支持 stdio MCP 的客户端可合并以下配置。路径改为实际安装位置，不能覆盖已有其他服务器配置。
 
@@ -24,3 +24,5 @@ MCP 支持 2025-11-25 及此前三个已列协商版本，stdio 只输出 JSON-R
 原 liubai_status / caches / files / scan / cancel_scan / plan 六个工具仍保留，明确需要 `npm run serve:legacy` 启动本机服务。它们不是静态报告依赖。LIUBAI_URL 仅对这些旧工具生效，只允许本机地址；非法 URL 不阻断 liubai_report。
 
 旧服务计划需要其独立 UI 人工确认。静态 HTML 中的复选框和 JSON 建议不会被服务当作执行凭据。
+
+`measureAllocated=true` 仅适用于显式新扫描，用于按文件身份去重测量分配量；与 reportOnly 不能同时使用，耗时会增加。

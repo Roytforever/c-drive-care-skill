@@ -12,7 +12,7 @@ def main():
     if hasattr(sys.stdout, 'reconfigure'):
         sys.stdout.reconfigure(encoding='utf-8')
     root = Path(__file__).resolve().parent
-    required = ('run.py', 'scripts/generate_report.py', 'server/scan-worker.py',
+    required = ('run.py', 'scripts/generate_report.py', 'scripts/cache_inventory.py', 'server/scan-worker.py',
                 'report-assets/template.html')
     files = {name: (root / name).is_file() for name in required}
     template_valid = False
